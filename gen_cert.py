@@ -1,15 +1,5 @@
-"""
-Gera a identidade do servidor:
-  - server_key.pem   -> chave privada RSA (sk_server). NUNCA sai da máquina do servidor.
-  - server_cert.pem  -> certificado autoassinado contendo pk_server.
-                        Esse arquivo é público: copie ele para a pasta de
-                        cada cliente (é o "pinning" -- o cliente vai confiar
-                        SÓ nesse certificado específico, não em qualquer CA).
-
-Rodar uma vez: python gen_cert.py
-"""
-
 import datetime
+import os
 
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.asymmetric import rsa
@@ -50,7 +40,9 @@ def gerar():
         .sign(sk_server, hashes.SHA256())
     )
 
-    with open("server_key.pem", "wb") as f:
+    os.makedirs("certs", exist_ok=True)
+
+    with open("certs/server_key.pem", "wb") as f:
         f.write(
             sk_server.private_bytes(
                 encoding=Encoding.PEM,
@@ -59,7 +51,7 @@ def gerar():
             )
         )
 
-    with open("server_cert.pem", "wb") as f:
+    with open("certs/server_cert.pem", "wb") as f:
         f.write(cert.public_bytes(Encoding.PEM))
 
     print("Gerado: server_key.pem (privado, fica só no servidor)")

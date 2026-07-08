@@ -1,12 +1,9 @@
 import asyncio
 import json
+import ssl
 import uuid
-import os
 
-from cryptography.hazmat.primitives.serialization import (
-    Encoding,
-    PublicFormat,
-)
+from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
 from cryptography.hazmat.primitives.asymmetric.x25519 import (
     X25519PrivateKey,
     X25519PublicKey,
@@ -15,172 +12,114 @@ from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from cryptography import x509
 
 import crypto_utils
+from google_login import fazer_login_google
+
+# mesmo client_id do Google Cloud Console
+from keys.google_keys import GOOGLE_CLIENT_ID
 
 
-# Certificado do servidor, pinado localmente (copiado manualmente da
-# máquina do servidor -- é isso que impede um MITM de te enganar com
-# um certificado forjado).
 with open("certs/server_cert.pem", "rb") as f:
-    cert_pinado = x509.load_pem_x509_certificate(f.read())
+    cert_pinado_bytes = f.read()
 
+cert_pinado = x509.load_pem_x509_certificate(cert_pinado_bytes)
 pk_server_pinado = cert_pinado.public_key()
 pk_server_der_pinado = pk_server_pinado.public_bytes(
-    encoding=Encoding.DER,
-    format=PublicFormat.SubjectPublicKeyInfo,
+    encoding=Encoding.DER, format=PublicFormat.SubjectPublicKeyInfo,
 )
 
 servidor_autenticado = False
-
-# client_id -> {public_key, key_send, key_recv, seq_send, seq_recv,
-#               iv_base_send, iv_base_recv}
 peers = {}
 
 
-def registrar_peer(meu_id, peer_id, peer_public_key_bytes, salt, sk_client):
-    """
-    Deriva as duas chaves de direção + os dois IV base para o par
-    (meu_id, peer_id), a partir do segredo ECDH e do salt de par
-    que o servidor gerou e mandou pros dois lados.
-    """
-    peer_public_key = X25519PublicKey.from_public_bytes(peer_public_key_bytes)
+def montar_contexto_tls_cliente():
+    #contexto de tls e configuração de certificado
+    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+    ctx.minimum_version = ssl.TLSVersion.TLSv1_3
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_REQUIRED
+    ctx.load_verify_locations(cafile="certs/server_cert.pem")
 
-    # Z_AB = ECDH(sk_A, pk_B) -- o segredo nunca trafega na rede
+    # mudar o arquivo apontado aqui para simular que o certificado mudou:
+    #ctx.load_verify_locations(cafile="certificado_falso.pem")
+
+    return ctx
+
+#tp3 refatorado
+def registrar_peer(meu_id, peer_id, peer_public_key_bytes, salt, sk_client):
+    #diffie helman pra gerar o shared secret
+    peer_public_key = X25519PublicKey.from_public_bytes(peer_public_key_bytes)
     shared_secret = sk_client.exchange(peer_public_key)
 
     label_envio, label_recebimento = crypto_utils.papel_na_conversa(meu_id, peer_id)
 
     key_send = crypto_utils.derivar_chave(shared_secret, salt, label_envio)
     key_recv = crypto_utils.derivar_chave(shared_secret, salt, label_recebimento)
-
-    # IV base por direção: derivado, não sorteado e transmitido à parte,
-    # pra não precisar de mais uma mensagem de handshake. Como cada par
-    # (shared_secret, salt) é único, os IV base também são únicos por par.
-    iv_base_send = crypto_utils.derivar_chave(
-        shared_secret, salt, label_envio + b"-iv"
-    )[:4]
-    iv_base_recv = crypto_utils.derivar_chave(
-        shared_secret, salt, label_recebimento + b"-iv"
-    )[:4]
+    iv_base_send = crypto_utils.derivar_chave(shared_secret, salt, label_envio + b"-iv")[:4]
+    iv_base_recv = crypto_utils.derivar_chave(shared_secret, salt, label_recebimento + b"-iv")[:4]
 
     peers[peer_id] = {
-        "public_key": peer_public_key,
-        "key_send": key_send,
-        "key_recv": key_recv,
-        "seq_send": 0,
-        "seq_recv": -1,
-        "iv_base_send": iv_base_send,
-        "iv_base_recv": iv_base_recv,
+        "public_key": peer_public_key, "key_send": key_send, "key_recv": key_recv,
+        "seq_send": 0, "seq_recv": -1,
+        "iv_base_send": iv_base_send, "iv_base_recv": iv_base_recv,
     }
-
     print(f"[CLIENTE] Chaves E2E derivadas para peer {peer_id}")
 
-
+#tp3 + refatorações
 async def receive_loop(reader, sk_client, meu_id):
-
     global servidor_autenticado
 
     while True:
-
         data = await reader.readline()
         if not data:
             break
-
         packet = json.loads(data.decode())
 
-        # --------------------------------------------------------------
-        # Autenticação do servidor (uma vez, logo no início da conexão)
-        # --------------------------------------------------------------
         if packet["type"] == "server_hello":
-
-            cert_recebido = packet["certificate"].encode()
-
-            # Pinning: o certificado recebido tem que ser BYTE A BYTE
-            # igual ao que já confiamos. Isso é mais forte que validar
-            # uma cadeia de CA (que não existe aqui, é autoassinado).
-            cert_recebido_obj = x509.load_pem_x509_certificate(cert_recebido)
-            if cert_recebido_obj.public_bytes(Encoding.DER) != \
-                    cert_pinado.public_bytes(Encoding.DER):
-                print("[CLIENTE] ALERTA: certificado do servidor não bate "
-                      "com o certificado pinado. Possível MITM. Abortando.")
+            cert_recebido = x509.load_pem_x509_certificate(packet["certificate"].encode())
+            if cert_recebido.public_bytes(Encoding.DER) != cert_pinado.public_bytes(Encoding.DER):
+                print("[CLIENTE] ALERTA: certificado não bate com o pinado. Abortando.")
                 return
 
             salt_srv = bytes.fromhex(packet["salt"])
             assinatura = bytes.fromhex(packet["signature"])
-
             pk_client_raw = sk_client.public_key().public_bytes(
                 encoding=Encoding.Raw, format=PublicFormat.Raw
             )
+            H = crypto_utils.calcular_H(pk_server_der_pinado, pk_client_raw, meu_id, salt_srv)
 
-            H = crypto_utils.calcular_H(
-                pk_server_der=pk_server_der_pinado,
-                pk_client_raw=pk_client_raw,
-                client_id=meu_id,
-                salt=salt_srv,
-            )
-
-            ok = crypto_utils.verificar_assinatura(pk_server_pinado, H, assinatura)
-
-            if not ok:
-                print("[CLIENTE] ALERTA: assinatura do servidor inválida. "
-                      "Abortando conexão.")
+            if not crypto_utils.verificar_assinatura(pk_server_pinado, H, assinatura):
+                print("[CLIENTE] ALERTA: assinatura RSA-PSS inválida. Abortando.")
                 return
 
             servidor_autenticado = True
-            print("[CLIENTE] Servidor autenticado com sucesso (RSA-PSS OK)")
+            print("[CLIENTE] Servidor autenticado (RSA-PSS OK, dentro do túnel TLS)")
 
-        # --------------------------------------------------------------
-        # Novo peer anunciado pelo servidor (broadcast)
-        # --------------------------------------------------------------
         elif packet["type"] == "peer":
-
             if not servidor_autenticado:
-                print("[CLIENTE] Ignorando peer: servidor ainda não autenticado")
                 continue
+            registrar_peer(
+                meu_id, packet["client_id"],
+                bytes.fromhex(packet["public_key"]), bytes.fromhex(packet["salt"]),
+                sk_client,
+            )
 
-            peer_id = packet["client_id"]
-            peer_public_key_bytes = bytes.fromhex(packet["public_key"])
-            salt = bytes.fromhex(packet["salt"])
-
-            registrar_peer(meu_id, peer_id, peer_public_key_bytes, salt, sk_client)
-
-        # --------------------------------------------------------------
-        # Mensagem E2E de algum peer
-        # --------------------------------------------------------------
         elif packet["type"] == "message":
-
             sender_id = packet["sender"]
             recipient_id = packet["recipient"]
             seq_no = packet["seq_no"]
             ciphertext = bytes.fromhex(packet["ciphertext"])
 
             if recipient_id != meu_id:
-                # não deveria acontecer (o servidor roteia por client_id),
-                # mas checar de novo aqui custa nada e é defesa em profundidade
                 continue
-
             peer = peers.get(sender_id)
-            if peer is None:
-                print(f"[CLIENTE] Mensagem de peer desconhecido {sender_id}, ignorando")
+            if peer is None or seq_no <= peer["seq_recv"]:
                 continue
 
-            if seq_no <= peer["seq_recv"]:
-                print("[CLIENTE] Replay detectado, descartando")
-                continue
-
-            # Nonce e AAD são RECALCULADOS localmente, nunca confiamos
-            # apenas no que veio no pacote -- se o valor usado na cifragem
-            # não bater exatamente com isso, a tag do GCM falha.
             nonce = peer["iv_base_recv"] + seq_no.to_bytes(8, "big")
-            aad = (
-                uuid.UUID(sender_id).bytes
-                + uuid.UUID(recipient_id).bytes
-                + seq_no.to_bytes(8, "big")
-            )
-
-            aes = AESGCM(peer["key_recv"])
+            aad = uuid.UUID(sender_id).bytes + uuid.UUID(recipient_id).bytes + seq_no.to_bytes(8, "big")
 
             try:
-                plaintext = aes.decrypt(nonce, ciphertext, aad)
+                plaintext = AESGCM(peer["key_recv"]).decrypt(nonce, ciphertext, aad)
             except Exception:
                 print("[CLIENTE] Falha de integridade: mensagem adulterada")
                 continue
@@ -188,7 +127,7 @@ async def receive_loop(reader, sk_client, meu_id):
             peer["seq_recv"] = seq_no
             print(f"\n[CLIENTE] Mensagem de {sender_id[:8]}: {plaintext.decode()}")
 
-
+#adicionado para escolher pra qm mandar mensagem
 async def escolher_destinatario():
     ids = list(peers.keys())
     print("\nPeers conhecidos:")
@@ -201,11 +140,9 @@ async def escolher_destinatario():
         print("Escolha inválida")
         return None
 
-
+#send loop igual o tp3
 async def send_loop(writer, meu_id):
-
     while True:
-
         if not peers:
             await asyncio.sleep(1)
             continue
@@ -219,52 +156,59 @@ async def send_loop(writer, meu_id):
         peer = peers[peer_id]
 
         peer["seq_send"] += 1
+
         seq_no = peer["seq_send"]
-
-        # TESTE DE REPLAY -- descomente para forçar o reenvio do mesmo
-        # seq_no e demonstrar que o destinatário rejeita (seq_no <= seq_recv).
-        #
-        # seq_no = 1
-
         nonce = peer["iv_base_send"] + seq_no.to_bytes(8, "big")
-        aad = (
-            uuid.UUID(meu_id).bytes
-            + uuid.UUID(peer_id).bytes
-            + seq_no.to_bytes(8, "big")
-        )
 
-        aes = AESGCM(peer["key_send"])
-        ciphertext = aes.encrypt(nonce, msg.encode(), aad)
-
+        aad = uuid.UUID(meu_id).bytes + uuid.UUID(peer_id).bytes + seq_no.to_bytes(8, "big")
+        ciphertext = AESGCM(peer["key_send"]).encrypt(nonce, msg.encode(), aad)
         packet = {
-            "type": "message",
-            "sender": meu_id,
-            "recipient": peer_id,
-            "seq_no": seq_no,
-            "ciphertext": ciphertext.hex(),
+            "type": "message", "sender": meu_id, "recipient": peer_id,
+            "seq_no": seq_no, "ciphertext": ciphertext.hex(),
         }
-
         writer.write((json.dumps(packet) + "\n").encode())
         await writer.drain()
 
 
 async def main():
 
-    reader, writer = await asyncio.open_connection("127.0.0.1", 8888)
+    ctx = montar_contexto_tls_cliente()
 
-    client_id = str(uuid.uuid4())
+    # server_hostname é obrigatório pro handshake TLS mesmo com
+    # check_hostname=False -- é só um rótulo pro SNI, não afeta a
+    # validação (que já é feita via o cert pinado).
+    reader, writer = await asyncio.open_connection(
+        "127.0.0.1", 8888, ssl=ctx, server_hostname="localhost",
+    )
+    print("[CLIENTE] Túnel TLS 1.3 estabelecido")
 
-    sk_client = X25519PrivateKey.generate()
-    pk_client = sk_client.public_key()
-    pk_bytes = pk_client.public_bytes(encoding=Encoding.Raw, format=PublicFormat.Raw)
+    #login Google ANTES de qualquer coisa do TP3 (ir pra google_login.py)
+    tokens = fazer_login_google(GOOGLE_CLIENT_ID)
 
-    writer.write((json.dumps({
-        "client_id": client_id,
-        "public_key": pk_bytes.hex(),
-    }) + "\n").encode())
+    id_token = tokens["id_token"]
+
+    #linha pra gerar erro de aldulteramento de jwt
+    # id_token = id_token + "adulterado"
+
+    writer.write((json.dumps({"type": "auth", "id_token": id_token}) + "\n").encode())
     await writer.drain()
 
-    print("[CLIENTE] Conectado. Meu client_id:", client_id)
+    resposta = json.loads((await reader.readline()).decode())
+    if resposta["type"] != "auth_ok":
+        print(f"[CLIENTE] Autenticação rejeitada: {resposta.get('motivo')}")
+        return
+
+    print(f"[CLIENTE] Autenticado como {resposta['email']}")
+
+    # Daqui pra baixo é o handshake TP3, sem mudança nenhuma
+    client_id = str(uuid.uuid4())
+    sk_client = X25519PrivateKey.generate()
+    pk_bytes = sk_client.public_key().public_bytes(encoding=Encoding.Raw, format=PublicFormat.Raw)
+
+    writer.write((json.dumps({"client_id": client_id, "public_key": pk_bytes.hex()}) + "\n").encode())
+    await writer.drain()
+
+    print("[CLIENTE] Meu client_id:", client_id)
 
     asyncio.create_task(receive_loop(reader, sk_client, client_id))
     asyncio.create_task(send_loop(writer, client_id))
